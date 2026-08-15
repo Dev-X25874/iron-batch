@@ -212,3 +212,5 @@ mod tests {
         assert_eq!(sched.running_count(), 0);
     }
 }
+
+// TODO: handle preemption when KV alloc fails mid-decode instead of silently skipping growth
