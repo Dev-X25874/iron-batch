@@ -24,7 +24,7 @@ People who want to read or exercise a small, working implementation of continuou
 
 ## Build & run
 
-Verified working with `rustc`/`cargo` 1.75 (crate versions in `Cargo.lock` are pinned accordingly — bump freely on a newer toolchain):
+Tested with `rustc`/`cargo` 1.75 (crate versions in `Cargo.lock` are pinned accordingly — bump freely on a newer toolchain):
 
 ```
 cargo build --release
