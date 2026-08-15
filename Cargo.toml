@@ -1,0 +1,43 @@
+[package]
+name = "fractile_infer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench_client"
+path = "src/bin/bench_client.rs"
+
+[dependencies]
+tokio = { version = "=1.38.1", features = ["full"] }
+axum = "=0.7.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
+rand = "0.8"
+clap = { version = "=4.4.18", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+libc = "0.2"
+bytes = "1"
+async-stream = "0.3"
+futures-core = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio-test = "0.4"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
