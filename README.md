@@ -1,4 +1,4 @@
-# Ferrox
+# Iron Batch
 
 > Iron-fast LLM inference scheduling in Rust — continuous batching, paged KV allocation, streaming HTTP, no model required.
 
