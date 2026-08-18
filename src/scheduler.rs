@@ -106,9 +106,17 @@ impl Scheduler {
         let admitted = self.admit();
         let mut ran = Vec::with_capacity(self.running.len());
         let mut finished = Vec::new();
-        let preempted = Vec::new(); // reserved: OOM-driven preemption hook
+        let mut preempted = Vec::new();
 
         for req in self.running.iter_mut() {
+            // A request admitted with max_new_tokens == 0 is already done —
+            // finish it without ever calling step_fn, instead of generating
+            // one token it never asked for.
+            if req.is_done() {
+                finished.push(req.seq_id);
+                continue;
+            }
+
             let eos = step_fn(&req.seq_id);
             req.generated += 1;
             if req.first_token_at.is_none() {
@@ -116,12 +124,17 @@ impl Scheduler {
             }
             ran.push(req.seq_id);
 
-            // grow KV cache every block_size tokens; ignore OOM here for
-            // brevity — production code would preempt the lowest-priority
-            // running seq back to `waiting` and retry.
-            if req.generated % self.allocator.block_size == 0 {
-                let _ = self.allocator.grow_seq(req.seq_id);
+            // grow KV cache every block_size tokens. If the pool is out of
+            // blocks, preempt this sequence back to `waiting` instead of
+            // silently letting it keep generating tokens with no KV storage
+            // behind them.
+            if req.generated % self.allocator.block_size == 0
+                && self.allocator.grow_seq(req.seq_id).is_err()
+            {
+                preempted.push(req.seq_id);
+                continue;
             }
+
             if eos || req.is_done() {
                 finished.push(req.seq_id);
             }
@@ -131,6 +144,19 @@ impl Scheduler {
             self.running.retain(|r| !finished.contains(&r.seq_id));
             for id in &finished {
                 self.allocator.free_seq(*id);
+            }
+        }
+
+        if !preempted.is_empty() {
+            let mut i = 0;
+            while i < self.running.len() {
+                if preempted.contains(&self.running[i].seq_id) {
+                    let req = self.running.remove(i);
+                    self.allocator.free_seq(req.seq_id);
+                    self.waiting.push_front(req);
+                } else {
+                    i += 1;
+                }
             }
         }
 
@@ -211,6 +237,61 @@ mod tests {
         assert_eq!(r1.finished, vec![1]);
         assert_eq!(sched.running_count(), 0);
     }
+
+    #[test]
+    fn zero_max_new_tokens_generates_nothing() {
+        let alloc = BlockAllocator::new(64, 16);
+        let mut sched = Scheduler::new(
+            SchedulerConfig {
+                max_batch_tokens: 1000,
+                max_running_seqs: 8,
+            },
+            alloc,
+        );
+        sched.enqueue(Request {
+            seq_id: 1,
+            prompt_tokens: 16,
+            max_new_tokens: 0,
+            generated: 0,
+            arrival: Instant::now(),
+            first_token_at: None,
+        });
+        let r1 = sched.step(|_| panic!("step_fn must not be called for a 0-token request"));
+        assert_eq!(r1.finished, vec![1]);
+        assert!(r1.ran.is_empty());
+    }
+
+    #[test]
+    fn oom_during_decode_preempts_instead_of_silently_continuing() {
+        // Only enough blocks for the prompt; the first growth attempt
+        // during decode must fail and preempt the sequence.
+        let alloc = BlockAllocator::new(1, 16);
+        let mut sched = Scheduler::new(
+            SchedulerConfig {
+                max_batch_tokens: 1000,
+                max_running_seqs: 8,
+            },
+            alloc,
+        );
+        sched.enqueue(Request {
+            seq_id: 1,
+            prompt_tokens: 16, // exactly 1 block, none left to grow into
+            max_new_tokens: 20,
+            generated: 0,
+            arrival: Instant::now(),
+            first_token_at: None,
+        });
+        // step 1: admits, generates token 1..15 without needing to grow
+        // (block_size is 16, so growth is only attempted every 16th token)
+        let mut report = sched.step(|_| false);
+        for _ in 0..15 {
+            report = sched.step(|_| false);
+        }
+        assert!(report.preempted.contains(&1));
+        assert_eq!(sched.running_count(), 0);
+        assert_eq!(sched.waiting_count(), 1); // back in the queue, not lost
+    }
 }
 
-// TODO: handle preemption when KV alloc fails mid-decode instead of silently skipping growth
+// Preemption is now handled: OOM during grow_seq() moves the sequence back
+// to `waiting` and frees its blocks rather than silently skipping growth.
