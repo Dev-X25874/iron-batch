@@ -40,6 +40,7 @@ struct AllocatorInner {
 pub enum AllocError {
     OutOfMemory,
     UnknownSeq(SeqId),
+    SeqAlreadyExists(SeqId),
 }
 
 impl BlockAllocator {
@@ -68,9 +69,15 @@ impl BlockAllocator {
     /// Register a new sequence and reserve its first `num_tokens` worth of
     /// blocks. Returns Err(OutOfMemory) without mutating state if the pool
     /// can't satisfy the request (caller should preempt/evict and retry).
+    /// Returns Err(SeqAlreadyExists) without mutating state if `seq_id` is
+    /// already registered — silently overwriting it would leak its
+    /// previously-held blocks (their refcount would never be decremented).
     pub fn allocate_seq(&self, seq_id: SeqId, num_tokens: u32) -> Result<(), AllocError> {
         let needed = self.blocks_needed(num_tokens);
         let mut inner = self.inner.lock();
+        if inner.page_tables.contains_key(&seq_id) {
+            return Err(AllocError::SeqAlreadyExists(seq_id));
+        }
         if inner.free_stack.len() < needed as usize {
             return Err(AllocError::OutOfMemory);
         }
@@ -87,18 +94,22 @@ impl BlockAllocator {
     /// Append one more block to a sequence as it decodes past its current
     /// capacity. This is the steady-state allocation path during
     /// autoregressive decode (one call roughly every `block_size` tokens).
+    ///
+    /// Existence of `seq_id` is checked *before* popping a block off the
+    /// free stack, so an UnknownSeq error never consumes a block that then
+    /// has nowhere to go (that was leaking one block per bad call).
     pub fn grow_seq(&self, seq_id: SeqId) -> Result<BlockId, AllocError> {
         let mut inner = self.inner.lock();
-        let id = inner
-            .free_stack
-            .pop()
-            .ok_or(AllocError::OutOfMemory)?;
+        if !inner.page_tables.contains_key(&seq_id) {
+            return Err(AllocError::UnknownSeq(seq_id));
+        }
+        let id = inner.free_stack.pop().ok_or(AllocError::OutOfMemory)?;
         inner.meta[id as usize].refcount = 1;
-        let table = inner
+        inner
             .page_tables
             .get_mut(&seq_id)
-            .ok_or(AllocError::UnknownSeq(seq_id))?;
-        table.push(id);
+            .expect("checked above")
+            .push(id);
         Ok(id)
     }
 
@@ -173,4 +184,26 @@ mod tests {
         a.free_seq(2);
         assert_eq!(a.num_free_blocks(), 4);
     }
-}
+
+    #[test]
+    fn duplicate_seq_id_is_rejected_not_leaked() {
+        let a = BlockAllocator::new(4, 16);
+        a.allocate_seq(1, 16).unwrap();
+        assert_eq!(a.num_free_blocks(), 3);
+        assert!(matches!(
+            a.allocate_seq(1, 16),
+            Err(AllocError::SeqAlreadyExists(1))
+        ));
+        assert_eq!(a.num_free_blocks(), 3); // unchanged, original blocks intact
+    }
+
+    #[test]
+    fn grow_unknown_seq_does_not_leak_a_block() {
+        let a = BlockAllocator::new(4, 16);
+        assert!(matches!(
+            a.grow_seq(99),
+            Err(AllocError::UnknownSeq(99))
+        ));
+        assert_eq!(a.num_free_blocks(), 4); // no block was popped and lost
+    }
+        }
