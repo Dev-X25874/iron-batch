@@ -1,7 +1,7 @@
 use clap::Parser;
-use fractile_infer::backend::{Backend, MockBackend};
-use fractile_infer::scheduler::SchedulerConfig;
-use fractile_infer::server::build_router;
+use iron_batch::backend::{Backend, MockBackend};
+use iron_batch::scheduler::SchedulerConfig;
+use iron_batch::server::build_router;
 use std::sync::Arc;
 use std::time::Duration;
 
