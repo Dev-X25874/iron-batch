@@ -71,12 +71,26 @@ pub fn build_router(
         loop {
             // drain newly-arrived requests without blocking the step loop
             while let Ok(req) = enqueue_rx.try_recv() {
-                scheduler.enqueue(req);
+                let seq_id = req.seq_id;
+                if let Err(e) = scheduler.enqueue(req) {
+                    tracing::warn!("rejecting request {seq_id}: {e:?}");
+                    if let Some(tx) = subs_for_loop.lock().await.remove(&seq_id) {
+                        let _ = tx.send(TokenEvent { token_index: 0, done: true });
+                    }
+                }
             }
             if !scheduler.has_work() {
                 // idle: block on the next arrival instead of busy-spinning
                 match enqueue_rx.recv().await {
-                    Some(req) => scheduler.enqueue(req),
+                    Some(req) => {
+                        let seq_id = req.seq_id;
+                        if let Err(e) = scheduler.enqueue(req) {
+                            tracing::warn!("rejecting request {seq_id}: {e:?}");
+                            if let Some(tx) = subs_for_loop.lock().await.remove(&seq_id) {
+                                let _ = tx.send(TokenEvent { token_index: 0, done: true });
+                            }
+                        }
+                    }
                     None => break, // all senders dropped, shut down
                 }
                 continue;
