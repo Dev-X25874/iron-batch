@@ -30,6 +30,7 @@ async fn main() {
     let args = Arc::new(Args::parse());
     let client = reqwest::Client::new();
     let tokens_total = Arc::new(AtomicU64::new(0));
+    let failures = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
 
     let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
@@ -40,9 +41,10 @@ async fn main() {
         let client = client.clone();
         let args = args.clone();
         let tokens_total = tokens_total.clone();
+        let failures = failures.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            let resp = client
+            let resp = match client
                 .post(format!("{}/generate", args.url))
                 .json(&serde_json::json!({
                     "prompt_tokens": args.prompt_tokens,
@@ -50,7 +52,16 @@ async fn main() {
                 }))
                 .send()
                 .await
-                .expect("request failed");
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Don't let one bad request take down the whole run --
+                    // that defeats the point of a load test. Just count it.
+                    eprintln!("request failed: {e}");
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
             let async_read = resp
                 .bytes_stream()
                 .map(|r| r.map_err(std::io::Error::other))
@@ -77,9 +88,11 @@ async fn main() {
 
     let elapsed = start.elapsed();
     let total = tokens_total.load(Ordering::Relaxed);
+    let failed = failures.load(Ordering::Relaxed);
     println!(
-        "requests={} tokens={} elapsed={:.2}s throughput={:.1} tok/s",
+        "requests={} failed={} tokens={} elapsed={:.2}s throughput={:.1} tok/s",
         args.total_requests,
+        failed,
         total,
         elapsed.as_secs_f64(),
         total as f64 / elapsed.as_secs_f64()
