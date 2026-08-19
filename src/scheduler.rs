@@ -7,6 +7,21 @@ use crate::kv_cache::{AllocError, BlockAllocator, SeqId};
 use std::collections::VecDeque;
 use std::time::Instant;
 
+/// Errors returned by [`Scheduler::enqueue`].
+#[derive(Debug)]
+pub enum SchedulerError {
+    /// The request's prompt alone exceeds `max_batch_tokens`, so it could
+    /// never be admitted. `admit()` is strict FCFS -- a request that
+    /// doesn't fit stays at the front of the queue rather than letting a
+    /// smaller request behind it jump ahead -- so queueing this would
+    /// permanently block every request behind it. Reject it here instead.
+    PromptExceedsBatchBudget {
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        max_batch_tokens: u32,
+    },
+}
+
 pub struct Request {
     pub seq_id: SeqId,
     pub prompt_tokens: u32,
@@ -54,8 +69,19 @@ impl Scheduler {
         }
     }
 
-    pub fn enqueue(&mut self, req: Request) {
+    /// Queue a request for admission. Rejects (without queueing) any
+    /// request whose prompt alone exceeds `max_batch_tokens` -- see
+    /// `SchedulerError::PromptExceedsBatchBudget`.
+    pub fn enqueue(&mut self, req: Request) -> Result<(), SchedulerError> {
+        if req.prompt_tokens > self.cfg.max_batch_tokens {
+            return Err(SchedulerError::PromptExceedsBatchBudget {
+                seq_id: req.seq_id,
+                prompt_tokens: req.prompt_tokens,
+                max_batch_tokens: self.cfg.max_batch_tokens,
+            });
+        }
         self.waiting.push_back(req);
+        Ok(())
     }
 
     fn running_token_budget(&self) -> u32 {
