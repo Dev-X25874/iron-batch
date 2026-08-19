@@ -1,13 +1,8 @@
-//! Block-based paged KV cache allocator, modeled on the PagedAttention design
-//! (vLLM) but written for a fixed-size physical block pool that a real
-//! backend would back with device-resident memory (HBM on Fractile's chip).
-//!
-//! Design goals:
-//!   - O(1) block alloc/free via a free-list stack
-//!   - reference counting so a shared prompt prefix (system prompt, few-shot
-//!     examples) can be reused across requests without copying
-//!   - no fragmentation: every block is `block_size` tokens, sequences are
-//!     built from a chain of block ids (a page table)
+//! Block-based paged KV allocator, basically PagedAttention (vLLM) but for
+//! a fixed-size block pool that a real backend would back with
+//! device-resident memory. O(1) alloc/free via a free-list stack, and
+//! blocks are refcounted so a shared prompt prefix (system prompt,
+//! few-shot examples) can be reused across sequences without copying.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -62,16 +57,17 @@ impl BlockAllocator {
     }
 
     /// Number of blocks required to hold `num_tokens` tokens for a new seq.
+    /// Saturating add so a pathological `num_tokens` (e.g. an unvalidated
+    /// value from the network) can't wrap around instead of just failing
+    /// the allocation like it should.
     pub fn blocks_needed(&self, num_tokens: u32) -> u32 {
-        (num_tokens + self.block_size - 1) / self.block_size
+        num_tokens.saturating_add(self.block_size - 1) / self.block_size
     }
 
-    /// Register a new sequence and reserve its first `num_tokens` worth of
-    /// blocks. Returns Err(OutOfMemory) without mutating state if the pool
-    /// can't satisfy the request (caller should preempt/evict and retry).
-    /// Returns Err(SeqAlreadyExists) without mutating state if `seq_id` is
-    /// already registered — silently overwriting it would leak its
-    /// previously-held blocks (their refcount would never be decremented).
+    /// Register a sequence and reserve `num_tokens` worth of blocks for it.
+    /// Fails clean (no state mutated) if we're out of blocks, or if
+    /// `seq_id` is already registered -- overwriting it would leak
+    /// whatever blocks it was already holding.
     pub fn allocate_seq(&self, seq_id: SeqId, num_tokens: u32) -> Result<(), AllocError> {
         let needed = self.blocks_needed(num_tokens);
         let mut inner = self.inner.lock();
@@ -91,13 +87,10 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// Append one more block to a sequence as it decodes past its current
-    /// capacity. This is the steady-state allocation path during
-    /// autoregressive decode (one call roughly every `block_size` tokens).
-    ///
-    /// Existence of `seq_id` is checked *before* popping a block off the
-    /// free stack, so an UnknownSeq error never consumes a block that then
-    /// has nowhere to go (that was leaking one block per bad call).
+    /// Append one block to a sequence once it decodes past its current
+    /// capacity -- called roughly every `block_size` tokens. We check
+    /// `seq_id` exists before popping off the free stack, on purpose: pop
+    /// first and you can leak a block on every bad call.
     pub fn grow_seq(&self, seq_id: SeqId) -> Result<BlockId, AllocError> {
         let mut inner = self.inner.lock();
         if !inner.page_tables.contains_key(&seq_id) {
