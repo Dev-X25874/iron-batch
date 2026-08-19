@@ -13,6 +13,7 @@
 //! and a `/dev/fractile0` node is the only change needed elsewhere.
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
 /// Mirrors what a real driver's ioctl surface would look like: a command
@@ -121,7 +122,9 @@ impl DeviceHandle for FakeDevice {
 /// ```
 struct _RealDeviceSketch;
 
+#[cfg(unix)]
 pub struct NullFdWrapper(pub RawFd);
+#[cfg(unix)]
 impl AsRawFd for NullFdWrapper {
     fn as_raw_fd(&self) -> RawFd {
         self.0
