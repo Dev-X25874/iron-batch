@@ -1,8 +1,7 @@
-//! HTTP front end. One background task owns the `Scheduler` and drives it
-//! in a tight decode loop; per-request handlers only enqueue work and read
-//! from a channel that the loop pushes generated tokens into. This keeps
-//! the scheduler single-threaded (no lock contention on the hot path) while
-//! still serving arbitrarily many concurrent HTTP requests.
+//! HTTP front end. One background task owns the `Scheduler` and drives the
+//! decode loop; request handlers just enqueue and read from a channel the
+//! loop pushes into. Keeps the scheduler single-threaded (no lock on the
+//! hot path) while still handling as many concurrent requests as you want.
 
 use crate::backend::Backend;
 use crate::kv_cache::{BlockAllocator, SeqId};
@@ -104,13 +103,27 @@ pub fn build_router(
             for seq_id in &report.ran {
                 if let Some(tx) = subs.get(seq_id) {
                     let done = report.finished.contains(seq_id);
-                    let _ = tx.send(TokenEvent {
-                        token_index: 0,
-                        done,
-                    });
+                    let token_index = report
+                        .generated_counts
+                        .get(seq_id)
+                        .map(|g| g.saturating_sub(1))
+                        .unwrap_or(0);
+                    let _ = tx.send(TokenEvent { token_index, done });
                 }
             }
             for seq_id in &report.finished {
+                // A request can finish without ever showing up in `ran` --
+                // e.g. max_new_tokens == 0, done the instant it's admitted.
+                // Those still need a done event, or the client just gets a
+                // stream that closes with nothing in it.
+                if !report.ran.contains(seq_id) {
+                    if let Some(tx) = subs.get(seq_id) {
+                        let _ = tx.send(TokenEvent {
+                            token_index: 0,
+                            done: true,
+                        });
+                    }
+                }
                 subs.remove(seq_id);
                 metrics_for_loop.record_completion();
             }
