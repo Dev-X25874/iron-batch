@@ -1,20 +1,19 @@
-//! Continuous batching scheduler (Orca / vLLM style): every decode step,
-//! finished sequences are evicted and newly-arrived requests are admitted
-//! into the running batch, so GPU/accelerator utilization never drains to
-//! zero waiting for the slowest sequence in a static batch to finish.
+//! Continuous batching scheduler, Orca/vLLM style. Every decode step we
+//! admit whatever new requests fit, advance the whole running batch by one
+//! token, and evict anything that just finished.
 
 use crate::kv_cache::{AllocError, BlockAllocator, SeqId};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 /// Errors returned by [`Scheduler::enqueue`].
 #[derive(Debug)]
 pub enum SchedulerError {
-    /// The request's prompt alone exceeds `max_batch_tokens`, so it could
-    /// never be admitted. `admit()` is strict FCFS -- a request that
-    /// doesn't fit stays at the front of the queue rather than letting a
-    /// smaller request behind it jump ahead -- so queueing this would
-    /// permanently block every request behind it. Reject it here instead.
+    /// Prompt alone is bigger than `max_batch_tokens` -- this thing could
+    /// never be admitted, ever. We're strict FCFS (a request that doesn't
+    /// fit stays at the head of the queue instead of letting something
+    /// smaller cut the line), so if we let this one queue up it just
+    /// wedges everyone behind it forever. Reject at enqueue time instead.
     PromptExceedsBatchBudget {
         seq_id: SeqId,
         prompt_tokens: u32,
@@ -57,6 +56,10 @@ pub struct StepReport {
     pub admitted: Vec<SeqId>,
     pub finished: Vec<SeqId>,
     pub preempted: Vec<SeqId>,
+    /// seq_id -> `generated` count *after* this step, for every seq_id in
+    /// `ran`. Callers (server.rs) use this to report which token index
+    /// they're on instead of making something up.
+    pub generated_counts: HashMap<SeqId, u32>,
 }
 
 impl Scheduler {
@@ -106,7 +109,16 @@ impl Scheduler {
                 break;
             }
             let req = self.waiting.pop_front().unwrap();
-            match self.allocator.allocate_seq(req.seq_id, req.prompt_tokens) {
+            // Reserve blocks for the request's full context so far, not
+            // just its prompt. First-time admission and `generated == 0`
+            // are the same case, but a request coming back from a
+            // preemption already has tokens behind it -- if we only ask
+            // for `prompt_tokens` worth of blocks here, it resumes with
+            // fewer blocks than the tokens it's already generated need,
+            // and the KV bookkeeping silently goes out of sync with the
+            // decode step count until it hits the next OOM.
+            let context_tokens = req.prompt_tokens + req.generated;
+            match self.allocator.allocate_seq(req.seq_id, context_tokens) {
                 Ok(()) => {
                     admitted.push(req.seq_id);
                     self.running.push(req);
@@ -133,11 +145,11 @@ impl Scheduler {
         let mut ran = Vec::with_capacity(self.running.len());
         let mut finished = Vec::new();
         let mut preempted = Vec::new();
+        let mut generated_counts = HashMap::new();
 
         for req in self.running.iter_mut() {
-            // A request admitted with max_new_tokens == 0 is already done —
-            // finish it without ever calling step_fn, instead of generating
-            // one token it never asked for.
+            // max_new_tokens == 0 means this thing was done the moment it
+            // was admitted. Don't call step_fn for a token nobody asked for.
             if req.is_done() {
                 finished.push(req.seq_id);
                 continue;
@@ -149,11 +161,11 @@ impl Scheduler {
                 req.first_token_at = Some(Instant::now());
             }
             ran.push(req.seq_id);
+            generated_counts.insert(req.seq_id, req.generated);
 
-            // grow KV cache every block_size tokens. If the pool is out of
-            // blocks, preempt this sequence back to `waiting` instead of
-            // silently letting it keep generating tokens with no KV storage
-            // behind them.
+            // Grow the KV cache every block_size tokens. If we're out of
+            // blocks, preempt back to `waiting` rather than let the
+            // sequence keep decoding with nowhere to put its KV.
             if req.generated % self.allocator.block_size == 0
                 && self.allocator.grow_seq(req.seq_id).is_err()
             {
@@ -191,6 +203,7 @@ impl Scheduler {
             admitted,
             finished,
             preempted,
+            generated_counts,
         }
     }
 
@@ -226,7 +239,7 @@ mod tests {
             alloc,
         );
         for i in 0..5 {
-            sched.enqueue(Request {
+            let _ = sched.enqueue(Request {
                 seq_id: i,
                 prompt_tokens: 30,
                 max_new_tokens: 4,
@@ -251,7 +264,7 @@ mod tests {
             },
             alloc,
         );
-        sched.enqueue(Request {
+        let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16,
             max_new_tokens: 1,
@@ -274,7 +287,7 @@ mod tests {
             },
             alloc,
         );
-        sched.enqueue(Request {
+        let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16,
             max_new_tokens: 0,
@@ -299,7 +312,7 @@ mod tests {
             },
             alloc,
         );
-        sched.enqueue(Request {
+        let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16, // exactly 1 block, none left to grow into
             max_new_tokens: 20,
@@ -317,7 +330,53 @@ mod tests {
         assert_eq!(sched.running_count(), 0);
         assert_eq!(sched.waiting_count(), 1); // back in the queue, not lost
     }
-}
 
-// Preemption is now handled: OOM during grow_seq() moves the sequence back
-// to `waiting` and frees its blocks rather than silently skipping growth.
+    #[test]
+    fn resumed_seq_reserves_blocks_for_tokens_already_generated() {
+        // seq 1 needs 1 block for its prompt and will need a 2nd once it's
+        // generated 16 tokens. We force that 2nd grow to OOM by parking an
+        // unrelated dummy sequence on the only other block, then free the
+        // dummy and check what seq 1 actually gets on resume: it should
+        // reserve for prompt + generated (32 tokens -> 2 blocks), not just
+        // its original prompt (16 tokens -> 1 block).
+        let alloc = BlockAllocator::new(2, 16);
+        let mut sched = Scheduler::new(
+            SchedulerConfig {
+                max_batch_tokens: 1000,
+                max_running_seqs: 8,
+            },
+            alloc,
+        );
+        sched
+            .enqueue(Request {
+                seq_id: 1,
+                prompt_tokens: 16,
+                max_new_tokens: 40,
+                generated: 0,
+                arrival: Instant::now(),
+                first_token_at: None,
+            })
+            .unwrap();
+
+        sched.step(|_| false); // admits seq 1, takes block 1 of 2
+        sched.allocator.allocate_seq(999, 16).unwrap(); // occupy the last block
+
+        let mut report;
+        loop {
+            report = sched.step(|_| false);
+            if report.preempted.contains(&1) {
+                break;
+            }
+        }
+        assert!(sched.allocator.page_table(1).is_none()); // freed on preempt
+
+        sched.allocator.free_seq(999); // give seq 1 somewhere to resume into
+        let resumed = sched.step(|_| false);
+        assert!(resumed.admitted.contains(&1));
+        assert_eq!(
+            sched.allocator.page_table(1).unwrap().len(),
+            2,
+            "resumed seq should reserve blocks for prompt + already-generated tokens"
+        );
+    }
+}
