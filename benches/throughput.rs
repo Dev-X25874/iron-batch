@@ -19,7 +19,7 @@ fn make_scheduler(n_seqs: u64) -> Scheduler {
         alloc,
     );
     for i in 0..n_seqs {
-        sched.enqueue(Request {
+        let _ = sched.enqueue(Request {
             seq_id: i,
             prompt_tokens: 64,
             max_new_tokens: 128,
