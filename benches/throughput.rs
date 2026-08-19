@@ -5,8 +5,8 @@
 //! allocator or admission policy.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fractile_infer::kv_cache::BlockAllocator;
-use fractile_infer::scheduler::{Request, Scheduler, SchedulerConfig};
+use iron_batch::kv_cache::BlockAllocator;
+use iron_batch::scheduler::{Request, Scheduler, SchedulerConfig};
 use std::time::Instant;
 
 fn make_scheduler(n_seqs: u64) -> Scheduler {
