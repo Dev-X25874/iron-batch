@@ -2,15 +2,11 @@
 
 Rust LLM inference server built around **continuous batching** and **paged KV cache allocation** — the two things that actually move the needle on throughput. Pluggable backend, streaming HTTP, no real weights or hardware needed to run.
 
-## Performance
-
-Mock backend (200µs/token). Real backend numbers vary by hardware.
-
-| Concurrency | Requests | Tokens Generated | Tok/s | TTFT p50 | TTFT p99 |
-|---|---|---|---|---|---|
-| 128 | 2000 | ~48k | ~3900 | 14ms | 61ms |
+see [BENCHMARKS.md](BENCHMARKS.md) for real numbers.
 
 ## Build and run
+
+Tested on rustc 1.75, should be fine on newer.
 
 ```bash
 cargo build --release
@@ -24,9 +20,9 @@ curl localhost:8080/metrics
 
 ## HTTP API
 
-### `POST /generate`
+### POST /generate
 
-Streams one JSON line per token.
+streams one JSON line per token
 
 ```bash
 curl -N -X POST localhost:8080/generate \
@@ -40,7 +36,9 @@ curl -N -X POST localhost:8080/generate \
 {"token_index":2,"done":true}
 ```
 
-### `GET /metrics`
+`max_new_tokens: 0` still returns a single done:true line, not an empty body.
+
+### GET /metrics
 
 ```json
 {
@@ -52,6 +50,8 @@ curl -N -X POST localhost:8080/generate \
   "ttft_p99_ms": 61
 }
 ```
+
+tok/s and TTFT are reported together on purpose — a scheduler that maximizes throughput by starving admission will tank TTFT, so you need both numbers at once.
 
 ## CLI flags
 
@@ -69,27 +69,27 @@ curl -N -X POST localhost:8080/generate \
 ## Testing and benchmarking
 
 ```bash
-cargo test              # unit + integration
-cargo bench             # scheduler_step group, isolated from HTTP/mock sleep
+cargo test
+cargo bench    # scheduler_step group, no HTTP or mock sleep overhead
 ```
 
-Covers: no block leaks across admit/evict/preempt cycles, no double-free on duplicate IDs, no leak on failed allocation, correct resume allocation for preempted sequences.
+test suite covers the stuff that actually matters — no block leaks across admit/evict/preempt cycles, no double-free, no under-allocation when a preempted sequence resumes.
 
-## Extending toward a real backend
+## Extending
 
-Three connection points, nothing else changes:
+three places to plug in, nothing else in the codebase changes:
 
-1. **Backend** — implement `Backend` for your runtime (CUDA kernel, model API, whatever).
-2. **Driver** — implement `DeviceHandle` with `nix::ioctl_*!` macros against a real device node.
-3. **KV memory** — `BlockAllocator` tracks block IDs only; wire them to real HBM offsets.
+1. **Backend** — implement `Backend` for your runtime (cuda kernel, model API, whatever)
+2. **Driver** — implement `DeviceHandle` with `nix::ioctl_*!` macros against a real device node. `src/driver/mod.rs` has the shape
+3. **KV memory** — `BlockAllocator` tracks block IDs only, not backing storage. wire those to real HBM offsets
 
-## What it doesn't do
+## what it doesnt do
 
-- Mock by default — tok/s reflects mock sleep latency. Opt into real backend with `--backend real --backend-url <url>`.
-- No auth, multi-tenancy, or persistence.
-- Not benchmarked against vLLM / SGLang / TGI.
-- No kernel driver — `driver/mod.rs` is userspace only.
+- mock by default, so tok/s from the bench client is mock latency not real inference. opt in with `--backend real --backend-url <url>`
+- no auth, no multi-tenancy, no persistence — single process
+- not benchmarked against vllm/sglang/tgi, not the point
+- no kernel driver, `driver/mod.rs` is userspace only
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT
