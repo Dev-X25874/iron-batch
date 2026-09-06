@@ -6,7 +6,7 @@ Rust LLM inference server built around **continuous batching** and **paged KV ca
 
 ## Performance
 
-> Metrics collected with `MockBackend` (200µs/token). For real backend numbers, see [BENCHMARKS.md](BENCHMARKS.md).
+> Metrics collected with `MockBackend` (200µs/token). For real backend numbers, see BENCHMARKS.md.
 
 | Concurrency | Requests | Tokens Generated | Tok/s | TTFT p50 | TTFT p99 |
 |---|---|---|---|---|---|
