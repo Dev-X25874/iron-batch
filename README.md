@@ -2,11 +2,9 @@
 
 Rust LLM inference server built around **continuous batching** and **paged KV cache allocation** — the two things that actually move the needle on throughput. Pluggable backend, streaming HTTP, no real weights or hardware needed to run.
 
-[Build and run](#build-and-run) | [HTTP API](#http-api) | [Benchmarks](#testing-and-benchmarking) | [Extending](#extending-toward-a-real-backend)
-
 ## Performance
 
-> Metrics collected with `MockBackend` (200µs/token). For real backend numbers, see BENCHMARKS.md.
+Mock backend (200µs/token). Real backend numbers vary by hardware.
 
 | Concurrency | Requests | Tokens Generated | Tok/s | TTFT p50 | TTFT p99 |
 |---|---|---|---|---|---|
@@ -87,7 +85,7 @@ Three connection points, nothing else changes:
 
 ## What it doesn't do
 
-- **Mock by default.** tok/s reflects mock sleep latency. Opt into real backend with `--backend real --backend-url <url>`.
+- Mock by default — tok/s reflects mock sleep latency. Opt into real backend with `--backend real --backend-url <url>`.
 - No auth, multi-tenancy, or persistence.
 - Not benchmarked against vLLM / SGLang / TGI.
 - No kernel driver — `driver/mod.rs` is userspace only.
