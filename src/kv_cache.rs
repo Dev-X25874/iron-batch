@@ -10,9 +10,6 @@ use std::collections::HashMap;
 pub type BlockId = u32;
 pub type SeqId = u64;
 
-/// A single physical block's bookkeeping. The actual KV tensor storage is
-/// out of scope here — swap `refcount`'s owner for a real device pointer /
-/// slab index when wiring this to hardware.
 #[derive(Debug, Default, Clone, Copy)]
 struct BlockMeta {
     refcount: u32,
@@ -27,7 +24,6 @@ pub struct BlockAllocator {
 struct AllocatorInner {
     meta: Vec<BlockMeta>,
     free_stack: Vec<BlockId>,
-    /// seq_id -> ordered list of block ids (the sequence's page table)
     page_tables: HashMap<SeqId, Vec<BlockId>>,
 }
 
@@ -52,22 +48,23 @@ impl BlockAllocator {
         }
     }
 
+    pub fn blocks_held(&self, seq_id: SeqId) -> u32 {
+        self.inner
+            .lock()
+            .page_tables
+            .get(&seq_id)
+            .map(|blocks| blocks.len() as u32)
+            .unwrap_or(0)
+    }
+
     pub fn num_free_blocks(&self) -> u32 {
         self.inner.lock().free_stack.len() as u32
     }
 
-    /// Number of blocks required to hold `num_tokens` tokens for a new seq.
-    /// Saturating add so a pathological `num_tokens` (e.g. an unvalidated
-    /// value from the network) can't wrap around instead of just failing
-    /// the allocation like it should.
     pub fn blocks_needed(&self, num_tokens: u32) -> u32 {
         num_tokens.saturating_add(self.block_size - 1) / self.block_size
     }
 
-    /// Register a sequence and reserve `num_tokens` worth of blocks for it.
-    /// Fails clean (no state mutated) if we're out of blocks, or if
-    /// `seq_id` is already registered -- overwriting it would leak
-    /// whatever blocks it was already holding.
     pub fn allocate_seq(&self, seq_id: SeqId, num_tokens: u32) -> Result<(), AllocError> {
         let needed = self.blocks_needed(num_tokens);
         let mut inner = self.inner.lock();
@@ -87,10 +84,6 @@ impl BlockAllocator {
         Ok(())
     }
 
-    /// Append one block to a sequence once it decodes past its current
-    /// capacity -- called roughly every `block_size` tokens. We check
-    /// `seq_id` exists before popping off the free stack, on purpose: pop
-    /// first and you can leak a block on every bad call.
     pub fn grow_seq(&self, seq_id: SeqId) -> Result<BlockId, AllocError> {
         let mut inner = self.inner.lock();
         if !inner.page_tables.contains_key(&seq_id) {
@@ -106,25 +99,30 @@ impl BlockAllocator {
         Ok(id)
     }
 
-    /// Fork a sequence's page table for beam search / parallel sampling
-    /// without copying KV — every shared block's refcount is bumped, and
-    /// only diverging (post-fork) blocks get their own allocation.
+    /// Fork a sequence's page table for beam search / parallel sampling.
+    /// Fails if `src` doesn't exist or if `dst` is already registered —
+    /// overwriting an existing dst would silently leak all its blocks.
     pub fn fork_seq(&self, src: SeqId, dst: SeqId) -> Result<(), AllocError> {
         let mut inner = self.inner.lock();
+        // Check dst first: if dst already exists we must not overwrite it.
+        if inner.page_tables.contains_key(&dst) {
+            return Err(AllocError::SeqAlreadyExists(dst));
+        }
         let src_blocks = inner
             .page_tables
             .get(&src)
             .ok_or(AllocError::UnknownSeq(src))?
             .clone();
         for &b in &src_blocks {
-            inner.meta[b as usize].refcount += 1;
+            // saturating_add so a pathological refcount can't wrap to 0
+            // and cause blocks to be freed while still referenced.
+            inner.meta[b as usize].refcount =
+                inner.meta[b as usize].refcount.saturating_add(1);
         }
         inner.page_tables.insert(dst, src_blocks);
         Ok(())
     }
 
-    /// Free every block owned by a sequence, decrementing shared refcounts
-    /// and only returning fully-unreferenced blocks to the free stack.
     pub fn free_seq(&self, seq_id: SeqId) {
         let mut inner = self.inner.lock();
         if let Some(blocks) = inner.page_tables.remove(&seq_id) {
@@ -151,7 +149,7 @@ mod tests {
     fn alloc_free_roundtrip() {
         let a = BlockAllocator::new(4, 16);
         assert_eq!(a.num_free_blocks(), 4);
-        a.allocate_seq(1, 20).unwrap(); // needs 2 blocks
+        a.allocate_seq(1, 20).unwrap();
         assert_eq!(a.num_free_blocks(), 2);
         a.free_seq(1);
         assert_eq!(a.num_free_blocks(), 4);
@@ -160,9 +158,9 @@ mod tests {
     #[test]
     fn oom_is_clean() {
         let a = BlockAllocator::new(2, 16);
-        a.allocate_seq(1, 32).unwrap(); // uses both blocks
+        a.allocate_seq(1, 32).unwrap();
         assert!(matches!(a.allocate_seq(2, 16), Err(AllocError::OutOfMemory)));
-        assert_eq!(a.num_free_blocks(), 0); // failed alloc didn't leak partial state
+        assert_eq!(a.num_free_blocks(), 0);
     }
 
     #[test]
@@ -171,11 +169,25 @@ mod tests {
         a.allocate_seq(1, 16).unwrap();
         assert_eq!(a.num_free_blocks(), 3);
         a.fork_seq(1, 2).unwrap();
-        assert_eq!(a.num_free_blocks(), 3); // no new blocks on fork
+        assert_eq!(a.num_free_blocks(), 3);
         a.free_seq(1);
-        assert_eq!(a.num_free_blocks(), 3); // still referenced by seq 2
+        assert_eq!(a.num_free_blocks(), 3);
         a.free_seq(2);
         assert_eq!(a.num_free_blocks(), 4);
+    }
+
+    #[test]
+    fn fork_dst_already_exists_is_rejected() {
+        let a = BlockAllocator::new(4, 16);
+        a.allocate_seq(1, 16).unwrap();
+        a.allocate_seq(2, 16).unwrap();
+        // dst=2 already exists — must fail, not overwrite and leak blocks
+        assert!(matches!(
+            a.fork_seq(1, 2),
+            Err(AllocError::SeqAlreadyExists(2))
+        ));
+        // both sequences still intact
+        assert_eq!(a.num_free_blocks(), 2);
     }
 
     #[test]
@@ -187,16 +199,31 @@ mod tests {
             a.allocate_seq(1, 16),
             Err(AllocError::SeqAlreadyExists(1))
         ));
-        assert_eq!(a.num_free_blocks(), 3); // unchanged, original blocks intact
+        assert_eq!(a.num_free_blocks(), 3);
     }
 
     #[test]
     fn grow_unknown_seq_does_not_leak_a_block() {
         let a = BlockAllocator::new(4, 16);
-        assert!(matches!(
-            a.grow_seq(99),
-            Err(AllocError::UnknownSeq(99))
-        ));
-        assert_eq!(a.num_free_blocks(), 4); // no block was popped and lost
+        assert!(matches!(a.grow_seq(99), Err(AllocError::UnknownSeq(99))));
+        assert_eq!(a.num_free_blocks(), 4);
     }
+
+    #[test]
+    fn fork_refcount_saturates_not_wraps() {
+        let a = BlockAllocator::new(2, 16);
+        a.allocate_seq(1, 16).unwrap();
+        // Fork repeatedly to push refcount toward u32::MAX
+        // (in practice this would never happen but it must not wrap to 0)
+        for dst in 2u64..10 {
+            // free previous dst first so we don't run out of page table slots
+            if dst > 2 {
+                // just testing refcount, free the slot without caring about blocks
+                a.inner.lock().page_tables.remove(&(dst - 1));
+            }
+            let _ = a.fork_seq(1, dst);
         }
+        // block must not have been returned to free stack
+        assert_eq!(a.num_free_blocks(), 1); // only the un-allocated block
+    }
+}

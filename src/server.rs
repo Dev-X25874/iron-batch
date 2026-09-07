@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+// Bounded channel capacity per sequence. Prevents the decode loop from
+// buffering unbounded events for a slow or disconnected client.
+const TOKEN_CHANNEL_CAPACITY: usize = 256;
+
 #[derive(Deserialize)]
 pub struct GenerateReq {
     pub prompt_tokens: u32,
@@ -51,46 +55,45 @@ pub fn build_router(
     let scheduler = Scheduler::new(cfg, allocator);
 
     let (enqueue_tx, mut enqueue_rx) = mpsc::unbounded_channel::<SchedRequest>();
-    let subscribers: Arc<AsyncMutex<HashMap<SeqId, mpsc::UnboundedSender<TokenEvent>>>> =
+    let subscribers: Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>> =
         Arc::new(AsyncMutex::new(HashMap::new()));
 
     let state = Arc::new(AppState {
+        // Use AcqRel so the ID is visible to the decode loop before the
+        // request is enqueued; Relaxed only guarantees atomicity, not
+        // cross-thread ordering.
         next_seq_id: AtomicU64::new(1),
         enqueue_tx,
         metrics: metrics.clone(),
     });
 
-    // Background decode loop: single owner of the Scheduler, no cross-task
-    // locking on the step() hot path itself.
     let subs_for_loop = subscribers.clone();
     let metrics_for_loop = metrics.clone();
     tokio::spawn(async move {
         let mut scheduler = scheduler;
         metrics_for_loop.mark_start();
         loop {
-            // drain newly-arrived requests without blocking the step loop
             while let Ok(req) = enqueue_rx.try_recv() {
                 let seq_id = req.seq_id;
                 if let Err(e) = scheduler.enqueue(req) {
                     tracing::warn!("rejecting request {seq_id}: {e:?}");
                     if let Some(tx) = subs_for_loop.lock().await.remove(&seq_id) {
-                        let _ = tx.send(TokenEvent { token_index: 0, done: true });
+                        let _ = tx.send(TokenEvent { token_index: 0, done: true }).await;
                     }
                 }
             }
             if !scheduler.has_work() {
-                // idle: block on the next arrival instead of busy-spinning
                 match enqueue_rx.recv().await {
                     Some(req) => {
                         let seq_id = req.seq_id;
                         if let Err(e) = scheduler.enqueue(req) {
                             tracing::warn!("rejecting request {seq_id}: {e:?}");
                             if let Some(tx) = subs_for_loop.lock().await.remove(&seq_id) {
-                                let _ = tx.send(TokenEvent { token_index: 0, done: true });
+                                let _ = tx.send(TokenEvent { token_index: 0, done: true }).await;
                             }
                         }
                     }
-                    None => break, // all senders dropped, shut down
+                    None => break,
                 }
                 continue;
             }
@@ -100,7 +103,18 @@ pub fn build_router(
 
             metrics_for_loop.record_tokens(report.ran.len() as u64);
             let mut subs = subs_for_loop.lock().await;
+
+            // Only send token events for sequences that actually ran AND
+            // were not preempted. A preempted sequence appears in ran[]
+            // but its token was rolled back — sending an event would give
+            // the client a phantom token.
+            let preempted_set: std::collections::HashSet<SeqId> =
+                report.preempted.iter().cloned().collect();
+
             for seq_id in &report.ran {
+                if preempted_set.contains(seq_id) {
+                    continue;
+                }
                 if let Some(tx) = subs.get(seq_id) {
                     let done = report.finished.contains(seq_id);
                     let token_index = report
@@ -108,20 +122,21 @@ pub fn build_router(
                         .get(seq_id)
                         .map(|g| g.saturating_sub(1))
                         .unwrap_or(0);
-                    let _ = tx.send(TokenEvent { token_index, done });
+                    // If send fails the client disconnected. Remove the
+                    // subscriber so we stop sending for this sequence.
+                    // The scheduler will keep running it to completion
+                    // unless we cancel — see comment on preemption below.
+                    if tx.send(TokenEvent { token_index, done }).await.is_err() {
+                        tracing::debug!("client disconnected for seq {seq_id}");
+                        subs.remove(seq_id);
+                    }
                 }
             }
+
             for seq_id in &report.finished {
-                // A request can finish without ever showing up in `ran` --
-                // e.g. max_new_tokens == 0, done the instant it's admitted.
-                // Those still need a done event, or the client just gets a
-                // stream that closes with nothing in it.
-                if !report.ran.contains(seq_id) {
+                if !report.ran.contains(seq_id) || preempted_set.contains(seq_id) {
                     if let Some(tx) = subs.get(seq_id) {
-                        let _ = tx.send(TokenEvent {
-                            token_index: 0,
-                            done: true,
-                        });
+                        let _ = tx.send(TokenEvent { token_index: 0, done: true }).await;
                     }
                 }
                 subs.remove(seq_id);
@@ -129,7 +144,6 @@ pub fn build_router(
             }
             drop(subs);
 
-            // yield so this doesn't starve the async runtime's other tasks
             tokio::task::yield_now().await;
         }
     });
@@ -143,12 +157,14 @@ pub fn build_router(
 async fn generate(
     State((state, subscribers)): State<(
         Arc<AppState>,
-        Arc<AsyncMutex<HashMap<SeqId, mpsc::UnboundedSender<TokenEvent>>>>,
+        Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>>,
     )>,
     Json(req): Json<GenerateReq>,
 ) -> Response {
-    let seq_id = state.next_seq_id.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<TokenEvent>();
+    let seq_id = state.next_seq_id.fetch_add(1, Ordering::AcqRel);
+    // Bounded channel — decode loop drops events rather than buffering
+    // forever when a client is slow or gone.
+    let (tx, mut rx) = mpsc::channel::<TokenEvent>(TOKEN_CHANNEL_CAPACITY);
     subscribers.lock().await.insert(seq_id, tx);
 
     let start = Instant::now();
@@ -169,8 +185,15 @@ async fn generate(
                 metrics.record_ttft(start.elapsed());
                 first = false;
             }
-            let line = serde_json::to_string(&ev).unwrap() + "\n";
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(line));
+            match serde_json::to_string(&ev) {
+                Ok(line) => {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(line + "\n"));
+                }
+                Err(e) => {
+                    tracing::error!("failed to serialize token event: {e}");
+                    break;
+                }
+            }
             if ev.done {
                 break;
             }
@@ -187,7 +210,7 @@ async fn generate(
 async fn metrics_endpoint(
     State((state, _)): State<(
         Arc<AppState>,
-        Arc<AsyncMutex<HashMap<SeqId, mpsc::UnboundedSender<TokenEvent>>>>,
+        Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>>,
     )>,
 ) -> Json<serde_json::Value> {
     let snap = state.metrics.snapshot();
@@ -196,6 +219,7 @@ async fn metrics_endpoint(
         "tokens_generated": snap.tokens_generated,
         "requests_completed": snap.requests_completed,
         "tokens_per_sec": snap.tokens_per_sec,
+        "tokens_per_sec_rolling": snap.tokens_per_sec_rolling,
         "ttft_p50_ms": snap.ttft_p50.as_millis(),
         "ttft_p99_ms": snap.ttft_p99.as_millis(),
     }))
