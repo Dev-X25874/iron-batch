@@ -22,8 +22,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-// Bounded channel capacity per sequence. Prevents the decode loop from
-// buffering unbounded events for a slow or disconnected client.
 const TOKEN_CHANNEL_CAPACITY: usize = 256;
 
 #[derive(Deserialize)]
@@ -59,9 +57,6 @@ pub fn build_router(
         Arc::new(AsyncMutex::new(HashMap::new()));
 
     let state = Arc::new(AppState {
-        // Use AcqRel so the ID is visible to the decode loop before the
-        // request is enqueued; Relaxed only guarantees atomicity, not
-        // cross-thread ordering.
         next_seq_id: AtomicU64::new(1),
         enqueue_tx,
         metrics: metrics.clone(),
@@ -101,13 +96,16 @@ pub fn build_router(
             let backend = backend.clone();
             let report = scheduler.step(|seq_id| backend.advance_token(seq_id));
 
+            // Call free_seq on the backend for every finished sequence so
+            // backends can clean up per-sequence state (RNG entries, token
+            // history buffers). Without this the trait fix does nothing.
+            for seq_id in &report.finished {
+                backend.free_seq(seq_id);
+            }
+
             metrics_for_loop.record_tokens(report.ran.len() as u64);
             let mut subs = subs_for_loop.lock().await;
 
-            // Only send token events for sequences that actually ran AND
-            // were not preempted. A preempted sequence appears in ran[]
-            // but its token was rolled back — sending an event would give
-            // the client a phantom token.
             let preempted_set: std::collections::HashSet<SeqId> =
                 report.preempted.iter().cloned().collect();
 
@@ -122,10 +120,6 @@ pub fn build_router(
                         .get(seq_id)
                         .map(|g| g.saturating_sub(1))
                         .unwrap_or(0);
-                    // If send fails the client disconnected. Remove the
-                    // subscriber so we stop sending for this sequence.
-                    // The scheduler will keep running it to completion
-                    // unless we cancel — see comment on preemption below.
                     if tx.send(TokenEvent { token_index, done }).await.is_err() {
                         tracing::debug!("client disconnected for seq {seq_id}");
                         subs.remove(seq_id);
@@ -162,8 +156,6 @@ async fn generate(
     Json(req): Json<GenerateReq>,
 ) -> Response {
     let seq_id = state.next_seq_id.fetch_add(1, Ordering::AcqRel);
-    // Bounded channel — decode loop drops events rather than buffering
-    // forever when a client is slow or gone.
     let (tx, mut rx) = mpsc::channel::<TokenEvent>(TOKEN_CHANNEL_CAPACITY);
     subscribers.lock().await.insert(seq_id, tx);
 

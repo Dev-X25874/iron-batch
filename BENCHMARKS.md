@@ -28,6 +28,7 @@ posts incorrectly named.
 - Test: single request, concurrency 1, 64 new tokens, warm container
   (cold-start runs excluded — see raw output below, both cold and warm
   runs are shown)
+- Prompt: 3 tokens (minimal prompt — see limitation note below)
 
 **Known limitation, stated plainly:** concurrency 1 tests single-sequence
 latency only. It does not exercise continuous batching across multiple
@@ -60,7 +61,7 @@ requests=1 failed=0 tokens=64 elapsed=2.98s throughput=21.5 tok/s     <- warm
 
 **vLLM:**
 ```
-> python compare.py --vllm-url "https://sayakmondal56--vllm-compare-fastapi-app.modal.run" --tokens 64
+> python vllm_compare.py --vllm-url "https://sayakmondal56--vllm-compare-fastapi-app.modal.run" --tokens 64
 [vLLM] 114.62s for 64 tokens -> 0.56 tok/s     <- cold start (full engine init on A10)
 [vLLM] 2.90s for 64 tokens -> 22.08 tok/s      <- warm
 ```
@@ -68,14 +69,24 @@ requests=1 failed=0 tokens=64 elapsed=2.98s throughput=21.5 tok/s     <- warm
 ## How to reproduce this yourself
 
 1. Clone this repo and set up Modal (`pip install modal && modal setup`).
-2. Deploy both backends: `modal deploy app.py` (iron-batch's real backend)
-   and `modal deploy vllm_app.py` (the vLLM/MRv2 comparison target).
-3. `cargo build --release`
-4. Run the server: `.\target\release\server.exe --backend real --backend-url <your-app.py-url>`
-5. Run the iron-batch benchmark twice (first call is cold-start, ignore
-   it): `.\target\release\bench_client.exe --concurrency 1 --total-requests 1 --prompt-tokens 3 --max-new-tokens 64`
-6. Run the vLLM comparison twice the same way:
-   `python compare.py --vllm-url <your-deployed-url> --tokens 64`
+2. Deploy both backends:
+   - `modal deploy app.py` (iron-batch's real backend)
+   - `modal deploy vllm_app.py` (the vLLM/MRv2 comparison target)
+3. Warmup the iron-batch endpoint after deploy to avoid cold-start on the
+   first benchmark call: `curl https://<your-app-url>/warmup`
+4. `cargo build --release`
+5. Run the server:
+   `.\target\release\server.exe --backend real --backend-url <your-app.py-url>`
+6. Run the iron-batch benchmark twice (first call is cold-start, ignore
+   it):
+   `.\target\release\bench_client.exe --concurrency 1 --total-requests 1 --prompt-tokens 3 --max-new-tokens 64`
+7. For the vLLM comparison, send a POST directly to the vLLM endpoint:
+   ```
+   curl -X POST https://<your-vllm-url>/generate \
+     -H 'content-type: application/json' \
+     -d '{"prompt": "Hello", "max_new_tokens": 64}'
+   ```
+   Time the response manually or wrap it in a script.
 
 Numbers will vary run to run (Modal's GPU allocation, network conditions,
 and whatever vLLM version is current when you deploy) but should land in
@@ -86,11 +97,11 @@ a similar range.
 Before switching to A10 + float16, the same test on a T4 with iron-batch
 running 4-bit quantized looked very different:
 
-| Engine                         | Tokens | Time    | Throughput  | vs vLLM      |
-|---------------------------------|--------|---------|-------------|--------------|
-| vLLM/MRv2 (T4, float16)         | 64     | 3.52s   | 18.19 tok/s | —            |
-| iron-batch v1 (T4, 4-bit)       | 64     | 109.65s | 0.6 tok/s   | ~30x slower  |
-| iron-batch v2 (T4, 4-bit, batched) | 64  | 8.96s   | 7.1 tok/s   | ~2.6x slower |
+| Engine                              | Tokens | Time    | Throughput  | vs vLLM      |
+|-------------------------------------|--------|---------|-------------|--------------|
+| vLLM/MRv2 (T4, float16)             | 64     | 3.52s   | 18.19 tok/s | —            |
+| iron-batch v1 (T4, 4-bit)           | 64     | 109.65s | 0.6 tok/s   | ~30x slower  |
+| iron-batch v2 (T4, 4-bit, batched)  | 64     | 8.96s   | 7.1 tok/s   | ~2.6x slower |
 
 Two changes closed that gap: batching 16-32 tokens per network call
 instead of 1 (cut ~64 round-trips to ~2-4), and moving to an A10 with
