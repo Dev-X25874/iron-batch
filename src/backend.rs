@@ -100,7 +100,7 @@ const HISTORY_CAP: usize = 512;
 /// network round-trip cost.
 pub struct RealBackend {
     endpoint: String,
-    // Using the async reqwest::Client. advance_token is a sync fn, so
+    // Uses the blocking reqwest::Client. advance_token is a sync fn, so
     // callers must run it inside tokio::task::spawn_blocking or similar
     // to avoid blocking Tokio worker threads.
     client: reqwest::blocking::Client,

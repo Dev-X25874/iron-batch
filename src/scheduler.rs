@@ -160,18 +160,23 @@ impl Scheduler {
             if req.first_token_at.is_none() {
                 req.first_token_at = Some(Instant::now());
             }
-            ran.push(req.seq_id);
             generated_counts.insert(req.seq_id, req.generated);
 
             // Grow the KV cache every block_size tokens. If we're out of
             // blocks, preempt back to `waiting` rather than let the
-            // sequence keep decoding with nowhere to put its KV.
+            // sequence keep decoding with nowhere to put its KV. A
+            // sequence preempted this step must not also land in `ran` --
+            // server.rs streams one token event per `ran` entry, and this
+            // token's KV was never committed, so reporting it as ran would
+            // send a phantom token event for output that was rolled back.
             if req.generated % self.allocator.block_size == 0
                 && self.allocator.grow_seq(req.seq_id).is_err()
             {
                 preempted.push(req.seq_id);
                 continue;
             }
+
+            ran.push(req.seq_id);
 
             if eos || req.is_done() {
                 finished.push(req.seq_id);
