@@ -24,6 +24,10 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 const TOKEN_CHANNEL_CAPACITY: usize = 256;
 
+/// Per-sequence sender used to stream token events out to the HTTP handler
+/// awaiting them. Shared as Axum app state alongside `AppState`.
+type Subscribers = Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>>;
+
 #[derive(Deserialize)]
 pub struct GenerateReq {
     pub prompt_tokens: u32,
@@ -53,8 +57,7 @@ pub fn build_router(
     let scheduler = Scheduler::new(cfg, allocator);
 
     let (enqueue_tx, mut enqueue_rx) = mpsc::unbounded_channel::<SchedRequest>();
-    let subscribers: Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>> =
-        Arc::new(AsyncMutex::new(HashMap::new()));
+    let subscribers: Subscribers = Arc::new(AsyncMutex::new(HashMap::new()));
 
     let state =
         Arc::new(AppState { next_seq_id: AtomicU64::new(1), enqueue_tx, metrics: metrics.clone() });
@@ -146,10 +149,7 @@ pub fn build_router(
 }
 
 async fn generate(
-    State((state, subscribers)): State<(
-        Arc<AppState>,
-        Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>>,
-    )>,
+    State((state, subscribers)): State<(Arc<AppState>, Subscribers)>,
     Json(req): Json<GenerateReq>,
 ) -> Response {
     let seq_id = state.next_seq_id.fetch_add(1, Ordering::AcqRel);
@@ -197,10 +197,7 @@ async fn generate(
 }
 
 async fn metrics_endpoint(
-    State((state, _)): State<(
-        Arc<AppState>,
-        Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>>,
-    )>,
+    State((state, _)): State<(Arc<AppState>, Subscribers)>,
 ) -> Json<serde_json::Value> {
     let snap = state.metrics.snapshot();
     Json(serde_json::json!({
