@@ -159,13 +159,8 @@ mod tests {
     fn fake_device_roundtrip() {
         let dev = FakeDevice::new(4096, 1024);
         assert_eq!(dev.free_blocks().unwrap(), 1024);
-        let fence = dev
-            .submit_batch(BatchDescriptor {
-                batch_id: 1,
-                num_seqs: 8,
-                ring_offset: 0,
-            })
-            .unwrap();
+        let fence =
+            dev.submit_batch(BatchDescriptor { batch_id: 1, num_seqs: 8, ring_offset: 0 }).unwrap();
         dev.wait_fence(fence).unwrap();
         assert_eq!(fence, 1);
     }

@@ -5,9 +5,9 @@
 //! `advance_token` call and nothing else in the crate changes.
 
 use crate::kv_cache::SeqId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 
 pub trait Backend: Send + Sync {
     /// Advance one sequence by one decode step. Returns true on EOS.
@@ -27,11 +27,7 @@ pub struct MockBackend {
 
 impl MockBackend {
     pub fn new(per_token_latency: Duration, eos_prob: f64) -> Self {
-        Self {
-            per_token_latency,
-            eos_prob,
-            rng_state: parking_lot::Mutex::new(HashMap::new()),
-        }
+        Self { per_token_latency, eos_prob, rng_state: parking_lot::Mutex::new(HashMap::new()) }
     }
 
     fn next_rand(&self, seq_id: &SeqId) -> f64 {
@@ -126,10 +122,7 @@ impl RealBackend {
         let resp = self
             .client
             .post(format!("{}/generate_batch", self.endpoint))
-            .json(&BatchRequest {
-                token_ids,
-                num_tokens: BATCH_SIZE,
-            })
+            .json(&BatchRequest { token_ids, num_tokens: BATCH_SIZE })
             .send()
             .map_err(|e| format!("RealBackend: request failed: {e}"))?
             .json::<BatchResponse>()

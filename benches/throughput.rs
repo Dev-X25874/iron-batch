@@ -12,10 +12,7 @@ fn make_scheduler(n_seqs: u64, prompt_tokens: u32, max_new_tokens: u32) -> Sched
     // Block pool large enough that alloc pressure never masks scheduling cost.
     let alloc = BlockAllocator::new(1 << 16, 16);
     let mut sched = Scheduler::new(
-        SchedulerConfig {
-            max_batch_tokens: 1 << 20,
-            max_running_seqs: n_seqs as usize,
-        },
+        SchedulerConfig { max_batch_tokens: 1 << 20, max_running_seqs: n_seqs as usize },
         alloc,
     );
     for i in 0..n_seqs {
@@ -66,10 +63,7 @@ fn bench_step_steady(c: &mut Criterion) {
                     let block_pool = (n as u32) * 4;
                     let alloc = BlockAllocator::new(block_pool, 16);
                     let mut sched = Scheduler::new(
-                        SchedulerConfig {
-                            max_batch_tokens: 1 << 20,
-                            max_running_seqs: n,
-                        },
+                        SchedulerConfig { max_batch_tokens: 1 << 20, max_running_seqs: n },
                         alloc,
                     );
                     for i in 0..n as u64 {

@@ -35,9 +35,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(Inner::default()),
-        }
+        Self { inner: Mutex::new(Inner::default()) }
     }
 
     pub fn mark_start(&self) {
@@ -84,7 +82,11 @@ impl Metrics {
         // Rolling tok/s: sum tokens in the window, divide by window duration.
         let tokens_per_sec_rolling = if g.token_log.len() >= 2 {
             let window_tokens: u64 = g.token_log.iter().map(|(_, n)| n).sum();
-            let window_secs = g.token_log.back().unwrap().0
+            let window_secs = g
+                .token_log
+                .back()
+                .unwrap()
+                .0
                 .duration_since(g.token_log.front().unwrap().0)
                 .as_secs_f64();
             if window_secs > 0.0 {

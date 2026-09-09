@@ -49,12 +49,7 @@ impl BlockAllocator {
     }
 
     pub fn blocks_held(&self, seq_id: SeqId) -> u32 {
-        self.inner
-            .lock()
-            .page_tables
-            .get(&seq_id)
-            .map(|blocks| blocks.len() as u32)
-            .unwrap_or(0)
+        self.inner.lock().page_tables.get(&seq_id).map(|blocks| blocks.len() as u32).unwrap_or(0)
     }
 
     pub fn num_free_blocks(&self) -> u32 {
@@ -91,11 +86,7 @@ impl BlockAllocator {
         }
         let id = inner.free_stack.pop().ok_or(AllocError::OutOfMemory)?;
         inner.meta[id as usize].refcount = 1;
-        inner
-            .page_tables
-            .get_mut(&seq_id)
-            .expect("checked above")
-            .push(id);
+        inner.page_tables.get_mut(&seq_id).expect("checked above").push(id);
         Ok(id)
     }
 
@@ -108,16 +99,11 @@ impl BlockAllocator {
         if inner.page_tables.contains_key(&dst) {
             return Err(AllocError::SeqAlreadyExists(dst));
         }
-        let src_blocks = inner
-            .page_tables
-            .get(&src)
-            .ok_or(AllocError::UnknownSeq(src))?
-            .clone();
+        let src_blocks = inner.page_tables.get(&src).ok_or(AllocError::UnknownSeq(src))?.clone();
         for &b in &src_blocks {
             // saturating_add so a pathological refcount can't wrap to 0
             // and cause blocks to be freed while still referenced.
-            inner.meta[b as usize].refcount =
-                inner.meta[b as usize].refcount.saturating_add(1);
+            inner.meta[b as usize].refcount = inner.meta[b as usize].refcount.saturating_add(1);
         }
         inner.page_tables.insert(dst, src_blocks);
         Ok(())
@@ -182,10 +168,7 @@ mod tests {
         a.allocate_seq(1, 16).unwrap();
         a.allocate_seq(2, 16).unwrap();
         // dst=2 already exists — must fail, not overwrite and leak blocks
-        assert!(matches!(
-            a.fork_seq(1, 2),
-            Err(AllocError::SeqAlreadyExists(2))
-        ));
+        assert!(matches!(a.fork_seq(1, 2), Err(AllocError::SeqAlreadyExists(2))));
         // both sequences still intact
         assert_eq!(a.num_free_blocks(), 2);
     }
@@ -195,10 +178,7 @@ mod tests {
         let a = BlockAllocator::new(4, 16);
         a.allocate_seq(1, 16).unwrap();
         assert_eq!(a.num_free_blocks(), 3);
-        assert!(matches!(
-            a.allocate_seq(1, 16),
-            Err(AllocError::SeqAlreadyExists(1))
-        ));
+        assert!(matches!(a.allocate_seq(1, 16), Err(AllocError::SeqAlreadyExists(1))));
         assert_eq!(a.num_free_blocks(), 3);
     }
 

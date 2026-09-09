@@ -56,11 +56,8 @@ pub fn build_router(
     let subscribers: Arc<AsyncMutex<HashMap<SeqId, mpsc::Sender<TokenEvent>>>> =
         Arc::new(AsyncMutex::new(HashMap::new()));
 
-    let state = Arc::new(AppState {
-        next_seq_id: AtomicU64::new(1),
-        enqueue_tx,
-        metrics: metrics.clone(),
-    });
+    let state =
+        Arc::new(AppState { next_seq_id: AtomicU64::new(1), enqueue_tx, metrics: metrics.clone() });
 
     let subs_for_loop = subscribers.clone();
     let metrics_for_loop = metrics.clone();

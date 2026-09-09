@@ -21,20 +21,13 @@ fn drains_mixed_batch_without_leaking_kv_blocks() {
     let total_blocks = 256;
     let block_size = 16;
     let alloc = BlockAllocator::new(total_blocks, block_size);
-    let mut sched = Scheduler::new(
-        SchedulerConfig {
-            max_batch_tokens: 512,
-            max_running_seqs: 16,
-        },
-        alloc,
-    );
+    let mut sched =
+        Scheduler::new(SchedulerConfig { max_batch_tokens: 512, max_running_seqs: 16 }, alloc);
 
     let backend = MockBackend::new(Duration::ZERO, 1.0 / 8.0);
     let n_requests = 40u64;
     for i in 0..n_requests {
-        sched
-            .enqueue(req(i, 24 + (i % 5) as u32 * 8, 4 + (i % 3) as u32))
-            .unwrap();
+        sched.enqueue(req(i, 24 + (i % 5) as u32 * 8, 4 + (i % 3) as u32)).unwrap();
     }
 
     let mut finished_ids = std::collections::HashSet::new();
@@ -46,10 +39,7 @@ fn drains_mixed_batch_without_leaking_kv_blocks() {
         }
         // Preempted sequences must NOT appear in finished
         for id in &report.preempted {
-            assert!(
-                !report.finished.contains(id),
-                "seq {id} is both preempted and finished"
-            );
+            assert!(!report.finished.contains(id), "seq {id} is both preempted and finished");
         }
         steps += 1;
         assert!(steps < 100_000, "scheduler appears stuck");
@@ -64,13 +54,8 @@ fn drains_mixed_batch_without_leaking_kv_blocks() {
 #[test]
 fn oversized_request_is_rejected_not_deadlocked() {
     let alloc = BlockAllocator::new(64, 16);
-    let mut sched = Scheduler::new(
-        SchedulerConfig {
-            max_batch_tokens: 100,
-            max_running_seqs: 8,
-        },
-        alloc,
-    );
+    let mut sched =
+        Scheduler::new(SchedulerConfig { max_batch_tokens: 100, max_running_seqs: 8 }, alloc);
 
     assert!(sched.enqueue(req(1, 200, 4)).is_err());
     assert_eq!(sched.waiting_count(), 0, "rejected request must not be queued");
@@ -94,13 +79,8 @@ fn preempted_seq_not_in_ran() {
     // block, OOMs, gets preempted. The step that preempts it must not also
     // have it in ran[].
     let alloc = BlockAllocator::new(1, 16);
-    let mut sched = Scheduler::new(
-        SchedulerConfig {
-            max_batch_tokens: 1000,
-            max_running_seqs: 8,
-        },
-        alloc,
-    );
+    let mut sched =
+        Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
     sched.enqueue(req(1, 16, 40)).unwrap();
 
     let mut preemption_step_found = false;
@@ -127,10 +107,7 @@ fn fork_seq_duplicate_dst_is_rejected() {
     alloc.allocate_seq(2, 16).unwrap();
     let free_before = alloc.num_free_blocks();
 
-    assert!(
-        alloc.fork_seq(1, 2).is_err(),
-        "fork into existing dst must fail"
-    );
+    assert!(alloc.fork_seq(1, 2).is_err(), "fork into existing dst must fail");
     assert_eq!(
         alloc.num_free_blocks(),
         free_before,
@@ -144,13 +121,8 @@ fn fork_seq_duplicate_dst_is_rejected() {
 #[test]
 fn backend_free_seq_called_on_completion() {
     let alloc = BlockAllocator::new(64, 16);
-    let mut sched = Scheduler::new(
-        SchedulerConfig {
-            max_batch_tokens: 1000,
-            max_running_seqs: 8,
-        },
-        alloc,
-    );
+    let mut sched =
+        Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
     let backend = MockBackend::new(Duration::ZERO, 1.0); // EOS on first token
     sched.enqueue(req(1, 16, 4)).unwrap();
 

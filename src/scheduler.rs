@@ -14,11 +14,7 @@ pub enum SchedulerError {
     /// fit stays at the head of the queue instead of letting something
     /// smaller cut the line), so if we let this one queue up it just
     /// wedges everyone behind it forever. Reject at enqueue time instead.
-    PromptExceedsBatchBudget {
-        seq_id: SeqId,
-        prompt_tokens: u32,
-        max_batch_tokens: u32,
-    },
+    PromptExceedsBatchBudget { seq_id: SeqId, prompt_tokens: u32, max_batch_tokens: u32 },
 }
 
 pub struct Request {
@@ -64,12 +60,7 @@ pub struct StepReport {
 
 impl Scheduler {
     pub fn new(cfg: SchedulerConfig, allocator: BlockAllocator) -> Self {
-        Self {
-            cfg,
-            allocator,
-            waiting: VecDeque::new(),
-            running: Vec::new(),
-        }
+        Self { cfg, allocator, waiting: VecDeque::new(), running: Vec::new() }
     }
 
     /// Queue a request for admission. Rejects (without queueing) any
@@ -88,10 +79,7 @@ impl Scheduler {
     }
 
     fn running_token_budget(&self) -> u32 {
-        self.running
-            .iter()
-            .map(|r| r.prompt_tokens + r.generated)
-            .sum()
+        self.running.iter().map(|r| r.prompt_tokens + r.generated).sum()
     }
 
     /// Admit as many waiting requests as fit under the batch-token and
@@ -203,13 +191,7 @@ impl Scheduler {
             }
         }
 
-        StepReport {
-            ran,
-            admitted,
-            finished,
-            preempted,
-            generated_counts,
-        }
+        StepReport { ran, admitted, finished, preempted, generated_counts }
     }
 
     pub fn has_work(&self) -> bool {
@@ -236,13 +218,8 @@ mod tests {
     #[test]
     fn admits_until_token_budget_full() {
         let alloc = BlockAllocator::new(64, 16);
-        let mut sched = Scheduler::new(
-            SchedulerConfig {
-                max_batch_tokens: 100,
-                max_running_seqs: 8,
-            },
-            alloc,
-        );
+        let mut sched =
+            Scheduler::new(SchedulerConfig { max_batch_tokens: 100, max_running_seqs: 8 }, alloc);
         for i in 0..5 {
             let _ = sched.enqueue(Request {
                 seq_id: i,
@@ -262,13 +239,8 @@ mod tests {
     #[test]
     fn finished_seqs_free_their_blocks() {
         let alloc = BlockAllocator::new(64, 16);
-        let mut sched = Scheduler::new(
-            SchedulerConfig {
-                max_batch_tokens: 1000,
-                max_running_seqs: 8,
-            },
-            alloc,
-        );
+        let mut sched =
+            Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
         let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16,
@@ -285,13 +257,8 @@ mod tests {
     #[test]
     fn zero_max_new_tokens_generates_nothing() {
         let alloc = BlockAllocator::new(64, 16);
-        let mut sched = Scheduler::new(
-            SchedulerConfig {
-                max_batch_tokens: 1000,
-                max_running_seqs: 8,
-            },
-            alloc,
-        );
+        let mut sched =
+            Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
         let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16,
@@ -310,13 +277,8 @@ mod tests {
         // Only enough blocks for the prompt; the first growth attempt
         // during decode must fail and preempt the sequence.
         let alloc = BlockAllocator::new(1, 16);
-        let mut sched = Scheduler::new(
-            SchedulerConfig {
-                max_batch_tokens: 1000,
-                max_running_seqs: 8,
-            },
-            alloc,
-        );
+        let mut sched =
+            Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
         let _ = sched.enqueue(Request {
             seq_id: 1,
             prompt_tokens: 16, // exactly 1 block, none left to grow into
@@ -345,13 +307,8 @@ mod tests {
         // reserve for prompt + generated (32 tokens -> 2 blocks), not just
         // its original prompt (16 tokens -> 1 block).
         let alloc = BlockAllocator::new(2, 16);
-        let mut sched = Scheduler::new(
-            SchedulerConfig {
-                max_batch_tokens: 1000,
-                max_running_seqs: 8,
-            },
-            alloc,
-        );
+        let mut sched =
+            Scheduler::new(SchedulerConfig { max_batch_tokens: 1000, max_running_seqs: 8 }, alloc);
         sched
             .enqueue(Request {
                 seq_id: 1,
